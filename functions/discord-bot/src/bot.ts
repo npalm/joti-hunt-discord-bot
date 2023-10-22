@@ -15,6 +15,8 @@ interface Article {
     content: string;
   };
   publish_at: string;
+  end_time?: string;
+  max_points?: number;
   type: 'news' | 'hint' | 'assignment' | undefined;
 }
 
@@ -25,24 +27,31 @@ export async function publish(): Promise<void> {
   logger.info(`Got ${articles.length} articles`);
 
   const ssmClient = new SSMClient({});
-  const latest = await ssmClient
+  let latestIsoString = await ssmClient
     .send(
       new GetParameterCommand({
         Name: latestProcessedArticleId,
       }),
     )
-    .then((result) => parseInt(result.Parameter?.Value ?? '-1'))
-    .catch((error) => {
-      logger.error(error);
-      return -1;
+    .then((result) => result.Parameter?.Value ?? '1970-01-01T00:00:00.000Z')
+    .catch(() => {
+      return '1970-01-01T00:00:00.000Z';
     });
-  // const latest = parseInt(latestProcessedArticleIdParam.Parameter?.Value ?? '-0');
-  console.log(`Latest processed article id: ${latest}`);
+  // convert latestIsoString to date
+  const latest = new Date(latestIsoString);
 
+  //let newLatest = latestIsoString;
   for (const article of articles) {
-    if (article.id > latest) {
+    const publishDate = new Date(article.publish_at);
+    if (!latestIsoString.includes(article.publish_at + '_' + article.id)) {
       logger.info(`New article id: ${article.id}`);
-      await publishToDiscord(article);
+      try {
+        await publishToDiscord(article);
+        latestIsoString = article.publish_at + '_' + article.id + ':' + latestIsoString;
+        latestIsoString = latestIsoString.slice(0, 500);
+      } catch (error) {
+        logger.error(`Error publishing article ${article.id} to discord: ${error}`);
+      }
     } else {
       logger.info(`Skipping article ${article.id} because it was already processed`);
     }
@@ -52,7 +61,7 @@ export async function publish(): Promise<void> {
   ssmClient.send(
     new PutParameterCommand({
       Name: latestProcessedArticleId,
-      Value: `${articles[articles.length - 1].id}`,
+      Value: latestIsoString,
       Type: 'String',
       Overwrite: true,
     }),
@@ -68,7 +77,15 @@ async function publishToDiscord(article: Article): Promise<void> {
   let prependMessage = '';
   switch (article.type) {
     case 'hint':
-      prependMessage = '## :bulb: Nieuwe hint!!!';
+      prependMessage = '# :bulb: Nieuwe hint!!!';
+      // add on a new line max point end end time
+      if (article.max_points) {
+        prependMessage += `\n:moneybag: Max punten: ${article.max_points}`;
+      }
+      if (article.end_time) {
+        prependMessage += ` \n:stopwatch: Eind tijd: ${getDateTime(article.end_time)}`;
+      }
+
       break;
     case 'assignment':
       prependMessage = '# :pencil: Nieuwe opdracht!!!';
@@ -87,12 +104,13 @@ async function publishToDiscord(article: Article): Promise<void> {
     month: 'short',
     year: 'numeric',
   });
+  // convert time to timezone +2
+  publishDate.setHours(publishDate.getHours() + 2);
   const humanReadableTime = publishDate.toLocaleTimeString('nl-NL', {
     hour: 'numeric',
     minute: 'numeric',
   });
 
-  
   // eslint-disable-next-line max-len
   const content = `${prependMessage}\n## [${article.title}](https://jotihunt.nl/)\n*${humanReadableTime} - ${humanReadableDate}*\n\n${markdownContent}`;
   const response = await axios.post(discordWebhookUrl, {
@@ -119,18 +137,28 @@ function convertHtmlToMarkdown(html: string): string {
 }
 
 async function getArticles(): Promise<Article[]> {
-  // we assume no more then 15 articles are published at once
-  const response = (await axios.get(articleEndpoint, {})).data;
-  if (!Array.isArray(response.data)) {
-    logger.error('API response data is not an array:', response.data);
-    return [];
-  }
-
+  const response = (await axios.get(articleEndpoint)).data;
   const articles = response.data as Article[];
-  articles.sort((a, b) => a.id - b.id);
 
-  // sort based on publish date oldest first
-  articles.sort((a, b) => new Date(a.publish_at).getTime() - new Date(b.publish_at).getTime());
+  // revert order
+  articles.reverse();
 
   return articles;
+}
+
+function getDateTime(isoDateStringinUTC: string): string {
+  const date = new Date(isoDateStringinUTC);
+  const humanReadableDate = date.toLocaleDateString('nl-NL', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+  // convert time to timezone +2
+  date.setHours(date.getHours() + 2);
+  const humanReadableTime = date.toLocaleTimeString('nl-NL', {
+    hour: 'numeric',
+    minute: 'numeric',
+  });
+
+  return `${humanReadableTime} - ${humanReadableDate}`;
 }
